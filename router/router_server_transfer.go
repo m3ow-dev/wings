@@ -9,18 +9,19 @@ import (
 	"emperror.dev/errors"
 	"github.com/gin-gonic/gin"
 
-	"github.com/pelican-dev/wings/environment"
-	"github.com/pelican-dev/wings/router/middleware"
-	"github.com/pelican-dev/wings/server"
-	"github.com/pelican-dev/wings/server/installer"
-	"github.com/pelican-dev/wings/server/transfer"
+	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/router/middleware"
+	"github.com/pelican/wings/server"
+	"github.com/pelican/wings/server/installer"
+	"github.com/pelican/wings/server/transfer"
 )
 
 // Data passed over to initiate a server transfer.
 type serverTransferRequest struct {
-	URL    string                  `binding:"required" json:"url"`
-	Token  string                  `binding:"required" json:"token"`
-	Server installer.ServerDetails `json:"server"`
+	URL     string                  `binding:"required" json:"url"`
+	Token   string                  `binding:"required" json:"token"`
+	Backups []string                `json:"backups"`
+	Server  installer.ServerDetails `json:"server"`
 }
 
 // postServerTransfer handles the start of a transfer for a server.
@@ -80,7 +81,7 @@ func postServerTransfer(c *gin.Context) {
 	go func() {
 		defer transfer.Outgoing().Remove(trnsfr)
 
-		if _, err := trnsfr.PushArchiveToTarget(data.URL, data.Token); err != nil {
+		if _, err := trnsfr.PushArchiveToTarget(data.URL, data.Token, data.Backups); err != nil {
 			notifyPanelOfFailure()
 
 			if err == context.Canceled {

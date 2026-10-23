@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,13 +17,14 @@ import (
 	"github.com/apex/log"
 	"github.com/creasty/defaults"
 	"github.com/goccy/go-json"
+	"github.com/pelican/wings/server/filesystem/quotas"
 
-	"github.com/pelican-dev/wings/config"
-	"github.com/pelican-dev/wings/environment"
-	"github.com/pelican-dev/wings/events"
-	"github.com/pelican-dev/wings/remote"
-	"github.com/pelican-dev/wings/server/filesystem"
-	"github.com/pelican-dev/wings/system"
+	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/events"
+	"github.com/pelican/wings/remote"
+	"github.com/pelican/wings/server/filesystem"
+	"github.com/pelican/wings/system"
 )
 
 // Server is the high level definition for a server instance being controlled
@@ -69,6 +71,7 @@ type Server struct {
 	// The console throttler instance used to control outputs.
 	throttler    *ConsoleThrottle
 	throttleOnce sync.Once
+	sftpBag      *system.ContextBag
 
 	// Tracks open websocket connections for the server.
 	wsBag       *WebsocketBag
@@ -123,6 +126,11 @@ func (s *Server) ID() string {
 	return s.Config().GetUuid()
 }
 
+// PID returns the Panel DBID for the server instance.
+func (s *Server) PID() int {
+	return s.Config().GetPID()
+}
+
 // Id returns the UUID for the server instance. This function is deprecated
 // in favor of Server.ID().
 //
@@ -140,7 +148,7 @@ func (s *Server) CtxCancel() {
 	}
 }
 
-// Returns a context instance for the server. This should be used to allow background
+// Context returns a context instance for the server. This should be used to allow background
 // tasks to be canceled if the server is removed. It will only be canceled when the
 // application is stopped or if the server gets deleted.
 func (s *Server) Context() context.Context {
@@ -166,7 +174,6 @@ func DetermineServerTimezone(envvars map[string]interface{}, defaultTimezone str
 	return defaultTimezone
 }
 
-
 // parseInvocation parses the start command in the same way we already do in the entrypoint
 // We can use this to set the container command with all variables replaced.
 func parseInvocation(invocation string, envvars map[string]interface{}, memory int64, port int, ip string) (parsed string) {
@@ -191,7 +198,7 @@ func parseInvocation(invocation string, envvars map[string]interface{}, memory i
 			invocation = strings.Replace(invocation, segment, tempSegments[i], 1)
 		}
 
-		// Replace the placeholders outside of protected segments
+		// Replace the placeholders outside protected segments
 		invocation = strings.ReplaceAll(invocation, placeholder, fmt.Sprint(varval))
 
 		// Restore protected segments
@@ -201,6 +208,10 @@ func parseInvocation(invocation string, envvars map[string]interface{}, memory i
 	}
 
 	// Replace the defaults with their configured values.
+	// and any connected SFTP clients. We don't need to worry about revoking any JWTs
+	// here since they'll be blocked from re-connecting to the websocket anyways. This
+	// just forces the client to disconnect and attempt to reconnect (rather than waiting
+	// on them to send a message and hit that disconnect logic).
 	invocation = strings.ReplaceAll(invocation, "${SERVER_PORT}", strconv.Itoa(port))
 	invocation = strings.ReplaceAll(invocation, "${SERVER_MEMORY}", strconv.Itoa(int(memory)))
 	invocation = strings.ReplaceAll(invocation, "${SERVER_IP}", ip)
@@ -259,15 +270,27 @@ func (s *Server) Sync() error {
 
 	// Update the disk space limits for the server whenever the configuration for
 	// it changes.
-	s.fs.SetDiskLimit(s.DiskSpace())
+	if config.Get().System.Quotas.Enabled {
+		if err = quotas.SetQuota(s.DiskSpace(), s.ID()); err != nil {
+			return err
+		}
+	} else {
+		s.fs.SetDiskLimit(s.DiskSpace())
+	}
 
 	s.SyncWithEnvironment()
+
+	// If the server is suspended immediately disconnect all open websocket connections.
+	if s.IsSuspended() {
+		s.Websockets().CancelAll()
+		s.Sftp().CancelAll()
+	}
 
 	return nil
 }
 
 // SyncWithConfiguration accepts a configuration object for a server and will
-// sync all of the values with the existing server state. This only replaces the
+// sync all values with the existing server state. This only replaces the
 // existing configuration and process configuration for the server. The
 // underlying environment will not be affected. This is because this function
 // can be called from scoped where the server may not be fully initialized,
@@ -312,7 +335,30 @@ func (s *Server) CreateEnvironment() error {
 		return err
 	}
 
+	// create the machine-id file on install
+	if config.Get().System.MachineID.Enable {
+		if err := s.CreateMachineID(); err != nil {
+			return err
+		}
+	}
+
 	return s.Environment.Create()
+}
+
+// CreateMachineID generates the machine-id file for the server
+func (s *Server) CreateMachineID() error {
+	// Hytale wants a machine-id in order to encrypt tokens for the server. So
+	// write a machine-id file for the server that contains the server's UUID
+	// without any dashes.
+	p := filepath.Join(config.Get().System.MachineID.Directory, s.ID())
+	s.Log().WithFields(log.Fields{
+		"path": p}).Debug("creating machine-id file")
+	machineID := []byte(strings.ReplaceAll(s.ID(), "-", ""))
+	if err := os.WriteFile(p, machineID, 0o644); err != nil {
+		return fmt.Errorf("failed to write machine-id (at '%s') for server '%s': %w", p, s.ID(), err)
+	}
+
+	return nil
 }
 
 // Checks if the server is marked as being suspended or not on the system.

@@ -1,6 +1,10 @@
+//go:build unix
+
 package filesystem
 
 import (
+	"golang.org/x/sys/unix"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -8,7 +12,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 
-	"github.com/pelican-dev/wings/internal/ufs"
+	"github.com/pelican/wings/internal/ufs"
 )
 
 type SpaceCheckingOpts struct {
@@ -164,6 +168,8 @@ func (fs *Filesystem) DirectorySize(root string) (int64, error) {
 		return 0, err
 	}
 
+	var hardLinks []uint64
+
 	var size atomic.Int64
 	err = fs.unixFS.WalkDirat(dirfd, name, func(dirfd int, name, _ string, d ufs.DirEntry, err error) error {
 		if err != nil {
@@ -180,8 +186,16 @@ func (fs *Filesystem) DirectorySize(root string) (int64, error) {
 			return errors.Wrap(err, "lstatat err")
 		}
 
-		// TODO: detect if info is a hard-link and de-duplicate it.
-		// ref; https://github.com/pelican-dev/wings/pull/181/files
+		var sysFileInfo = info.Sys().(*unix.Stat_t)
+		if sysFileInfo.Nlink > 1 {
+			// Hard links have the same inode number
+			if slices.Contains(hardLinks, sysFileInfo.Ino) {
+				// Don't add hard links size twice
+				return nil
+			} else {
+				hardLinks = append(hardLinks, sysFileInfo.Ino)
+			}
+		}
 
 		size.Add(info.Size())
 		return nil
@@ -194,6 +208,32 @@ func (fs *Filesystem) HasSpaceFor(size int64) error {
 		return newFilesystemError(ErrCodeDiskSpace, nil)
 	}
 	return nil
+}
+
+func (fs *Filesystem) reserveDisk(size int64) error {
+	if size <= 0 {
+		return nil
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if err := fs.HasSpaceFor(size); err != nil {
+		return err
+	}
+	fs.unixFS.Add(size)
+	return nil
+}
+
+func (fs *Filesystem) adjustDisk(size int64) int64 {
+	if size == 0 {
+		return fs.CachedUsage()
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	return fs.unixFS.Add(size)
 }
 
 // Updates the disk usage for the Filesystem instance.

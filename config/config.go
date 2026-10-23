@@ -11,22 +11,20 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"text/template"
 	"time"
-
-	"github.com/gbrlsnchs/jwt/v3"
 
 	"emperror.dev/errors"
 	"github.com/acobaugh/osrelease"
 	"github.com/apex/log"
 	"github.com/creasty/defaults"
-	"golang.org/x/sys/unix"
+	"github.com/gbrlsnchs/jwt/v3"
 	"gopkg.in/yaml.v2"
 
-	"github.com/pelican-dev/wings/system"
+	"github.com/pelican/wings/system"
 )
 
 const DefaultLocation = "/etc/pelican/config.yml"
@@ -70,6 +68,8 @@ type SftpConfiguration struct {
 	Port int `default:"2022" json:"bind_port" yaml:"bind_port"`
 	// If set to true, no write actions will be allowed on the SFTP server.
 	ReadOnly bool `default:"false" yaml:"read_only"`
+	// If set to true users won't be able to login using their password.
+	KeyOnly bool `default:"false" yaml:"key_only"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -126,6 +126,12 @@ type RemoteQueryConfiguration struct {
 	// 50 servers is likely just as quick as two for 100 or one for 400, and will certainly
 	// be less likely to cause performance issues on the Panel.
 	BootServersPerPage int `default:"50" yaml:"boot_servers_per_page"`
+
+	//When using services like Cloudflare Access to manage access to
+	//a specific system via an external authentication system,
+	//it is possible to add special headers to bypass authentication.
+	//The mentioned headers can be appended to queries sent from Wings to the panel.
+	CustomHeaders map[string]string `yaml:"custom_headers"`
 }
 
 // SystemConfiguration defines basic system configuration settings.
@@ -179,11 +185,23 @@ type SystemConfiguration struct {
 		Uid int `yaml:"uid"`
 		Gid int `yaml:"gid"`
 
-		// Passwd controls weather a passwd file is mounted in the container
-		// at /etc/passwd to resolve missing user issues
-		Passwd     bool   `json:"mount_passwd" yaml:"mount_passwd" default:"true"`
-		PasswdFile string `json:"passwd_file" yaml:"passwd_file" default:"/etc/pelican/passwd"`
-	} `yaml:"user"`
+		// Passwd controls weather a passwd and group file is mounted in the container
+		// at /etc/passwd to resolve missing user/group issues inside the container
+		Passwd struct {
+			Enable    bool   `json:"enable" yaml:"enable" default:"true"`
+			Directory string `json:"directory" yaml:"directory" default:"/etc/pelican"`
+		} `json:"passwd" yaml:"passwd"`
+	} `json:"user" yaml:"user"`
+
+	// MachineID manages the mounting of a 'machine-id' file for containers as required for
+	// some game servers. I.E. Hytale
+	MachineID struct {
+		// Enable controls if the machine-id file is generated and mounted into the server container
+		// This is enabled by default
+		Enable bool `json:"enable" yaml:"enable" default:"true"`
+		// FilePath is the full path to the machine-id file that will be generated and mounted
+		Directory string `json:"directory" yaml:"directory" default:"/etc/pelican/machine-id"`
+	} `json:"machine_id" yaml:"machine_id"`
 
 	// The amount of time in seconds that can elapse before a server's disk space calculation is
 	// considered stale and a re-check should occur. DANGER: setting this value too low can seriously
@@ -194,6 +212,11 @@ type SystemConfiguration struct {
 	// by a server and should only be set in extreme scenarios where performance is critical and
 	// disk usage is not a concern.
 	DiskCheckInterval int64 `default:"150" yaml:"disk_check_interval"`
+
+	// Quotas define is quota management is enabled on the Data directory
+	Quotas struct {
+		Enabled bool `json:"enabled" yaml:"enabled" default:"false"`
+	} `json:"quotas" yaml:"quotas"`
 
 	// ActivitySendInterval is the amount of time that should ellapse between aggregated server activity
 	// being sent to the Panel. By default this will send activity collected over the last minute. Keep
@@ -266,6 +289,11 @@ type Backups struct {
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
 
+
+	// RestoreHostAllowlist allows backup restore downloads to connect to otherwise blocked
+	// private/internal destinations. Entries may be hostnames, IP addresses, or CIDR ranges.
+	RestoreHostAllowlist []string `yaml:"restore_host_allowlist"`
+
 	// RemoveBackupsOnServerDelete deletes backups associated with a server when the server is deleted
 	RemoveBackupsOnServerDelete bool `default:"true" yaml:"remove_backups_on_server_delete"`
 }
@@ -278,6 +306,17 @@ type Transfers struct {
 	//
 	// Defaults to 0 (unlimited)
 	DownloadLimit int `default:"0" yaml:"download_limit"`
+
+	// StoragePool configures whether this node participates in a shared storage pool.
+	StoragePool StoragePoolConfiguration `yaml:"storage_pool"`
+}
+
+type StoragePoolConfiguration struct {
+	// Enabled signals that this node shares a common data volume with other nodes.
+	Enabled bool `default:"false" yaml:"enabled"`
+
+	// PoolName is a per-node identifier used to compare shared storage pool membership across nodes.
+	PoolName string `yaml:"pool_name"`
 }
 
 type ConsoleThrottles struct {
@@ -308,6 +347,10 @@ type Configuration struct {
 	// Determines if wings should be running in debug mode. This value is ignored
 	// if the debug flag is passed through the command line arguments.
 	Debug bool
+
+	// Determines if wings should run with minimal logging output. This value is
+	// ignored if debug mode is enabled.
+	Quiet bool
 
 	AppName string `default:"pelican" json:"app_name" yaml:"app_name"`
 
@@ -484,6 +527,18 @@ func EnsurePelicanUser() error {
 		return err
 	}
 
+	// macOS doesn't have useradd, use the current user like rootless mode.
+	if sysName == "darwin" {
+		u, err := user.Current()
+		if err != nil {
+			return err
+		}
+		_config.System.Username = u.Username
+		_config.System.User.Uid = system.MustInt(u.Uid)
+		_config.System.User.Gid = system.MustInt(u.Gid)
+		return nil
+	}
+
 	// Our way of detecting if wings is running inside of Docker.
 	if sysName == "distroless" {
 		_config.System.Username = system.FirstNotEmpty(os.Getenv("WINGS_USERNAME"), "pelican")
@@ -596,19 +651,6 @@ func ConfigureDirectories() error {
 		return err
 	}
 
-	log.WithField("filepath", _config.System.User.PasswdFile).Debug("ensuring passwd file exists")
-	if passwd, err := os.Create(_config.System.User.PasswdFile); err != nil {
-		return err
-	} else {
-		// the WriteFile method returns an error if unsuccessful
-		err := os.WriteFile(passwd.Name(), []byte(fmt.Sprintf("container:x:%d:%d::/home/container:/usr/sbin/nologin", _config.System.User.Uid, _config.System.User.Gid)), 0644)
-		// handle this error
-		if err != nil {
-			// print it out
-			fmt.Println(err)
-		}
-	}
-
 	// There are a non-trivial number of users out there whose data directories are actually a
 	// symlink to another location on the disk. If we do not resolve that final destination at this
 	// point things will appear to work, but endless errors will be encountered when we try to
@@ -630,6 +672,11 @@ func ConfigureDirectories() error {
 		return err
 	}
 
+	log.WithField("path", _config.System.TmpDirectory).Debug("ensuring temporary data directory exists")
+	if err := os.MkdirAll(_config.System.TmpDirectory, 0o700); err != nil {
+		return err
+	}
+
 	log.WithField("path", _config.System.ArchiveDirectory).Debug("ensuring archive data directory exists")
 	if err := os.MkdirAll(_config.System.ArchiveDirectory, 0o700); err != nil {
 		return err
@@ -640,7 +687,40 @@ func ConfigureDirectories() error {
 		return err
 	}
 
+	log.WithField("path", _config.System.User.Passwd.Directory).Debug("ensuring passwd directory exists")
+	if err := os.MkdirAll(_config.System.User.Passwd.Directory, 0o700); err != nil {
+		return err
+	}
+
+	log.WithField("path", _config.System.MachineID.Directory).Debug("ensuring machine-id directory exists")
+	if err := os.MkdirAll(_config.System.MachineID.Directory, 0o700); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ConfigurePasswd generates the passwd and group files to be used by
+// this looks cleaner than the previous way and is similar to pterodactyl
+func ConfigurePasswd() (err error) {
+	if !_config.System.User.Passwd.Enable {
+		return
+	}
+	log.WithField("filepath", filepath.Join(_config.System.User.Passwd.Directory, "passwd")).
+		Debug("ensuring passwd file exists")
+	if err = os.WriteFile(filepath.Join(_config.System.User.Passwd.Directory, "passwd"),
+		[]byte(fmt.Sprintf("container:x:%d:%d::/home/container:/usr/sbin/nologin",
+			_config.System.User.Uid, _config.System.User.Gid)), 0644); err != nil {
+		return fmt.Errorf("could not write passwd file: %w", err)
+	}
+
+	log.WithField("filepath", filepath.Join(_config.System.User.Passwd.Directory, "group")).
+		Debug("ensuring group file exists")
+	if err = os.WriteFile(filepath.Join(_config.System.User.Passwd.Directory, "group"),
+		[]byte(fmt.Sprintf("container:x:%d:container",
+			_config.System.User.Gid)), 0644); err != nil {
+		return fmt.Errorf("could not write group file: %w", err)
+	}
+	return
 }
 
 // EnableLogRotation writes a logrotate file for wings to the system logrotate
@@ -747,45 +827,15 @@ func ConfigureTimezone() error {
 
 // Gets the system release name.
 func getSystemName() (string, error) {
+	if runtime.GOOS == "darwin" {
+		return "darwin", nil
+	}
 	// use osrelease to get release version and ID
 	release, err := osrelease.Read()
 	if err != nil {
 		return "", err
 	}
 	return release["ID"], nil
-}
-
-var (
-	openat2    atomic.Bool
-	openat2Set atomic.Bool
-)
-
-func UseOpenat2() bool {
-	if openat2Set.Load() {
-		return openat2.Load()
-	}
-	defer openat2Set.Store(true)
-
-	c := Get()
-	openatMode := c.System.OpenatMode
-	switch openatMode {
-	case "openat2":
-		openat2.Store(true)
-		return true
-	case "openat":
-		openat2.Store(false)
-		return false
-	default:
-		fd, err := unix.Openat2(unix.AT_FDCWD, "/", &unix.OpenHow{})
-		if err != nil {
-			log.WithError(err).Warn("error occurred while checking for openat2 support, falling back to openat")
-			openat2.Store(false)
-			return false
-		}
-		_ = unix.Close(fd)
-		openat2.Store(true)
-		return true
-	}
 }
 
 // Expand expands an input string by calling [os.ExpandEnv] to expand all

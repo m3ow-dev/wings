@@ -8,17 +8,17 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pelican-dev/wings/config"
-
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
+	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/server/filesystem/quotas"
 
-	"github.com/pelican-dev/wings/router/downloader"
-	"github.com/pelican-dev/wings/router/middleware"
-	"github.com/pelican-dev/wings/router/tokens"
-	"github.com/pelican-dev/wings/server"
-	"github.com/pelican-dev/wings/server/transfer"
+	"github.com/pelican/wings/router/downloader"
+	"github.com/pelican/wings/router/middleware"
+	"github.com/pelican/wings/router/tokens"
+	"github.com/pelican/wings/server"
+	"github.com/pelican/wings/server/transfer"
 )
 
 // Returns a single server from the collection of servers.
@@ -75,14 +75,13 @@ func getServerInstallLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": output})
 }
 
-
 // Handles a request to control the power state of a server. If the action being passed
 // through is invalid a 404 is returned. Otherwise, a HTTP/202 Accepted response is returned
 // and the actual power action is run asynchronously so that we don't have to block the
 // request until a potentially slow operation completes.
 //
 // This is done because for the most part the Panel is using websockets to determine when
-// things are happening, so theres no reason to sit and wait for a request to finish. We'll
+// things are happening, so there's no reason to sit and wait for a request to finish. We'll
 // just see over the socket if something isn't working correctly.
 func postServerPower(c *gin.Context) {
 	s := ExtractServer(c)
@@ -250,7 +249,7 @@ func deleteServer(c *gin.Context) {
 	// Remove the install log from this server
 	filename := filepath.Join(config.Get().System.LogDirectory, "install", ID+".log")
 	err := os.Remove(filename)
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		log.WithFields(log.Fields{"server_id": ID, "error": err}).Warn("failed to remove server install log during deletion process")
 	}
 
@@ -276,12 +275,40 @@ func deleteServer(c *gin.Context) {
 	//
 	// In addition, servers with large amounts of files can take some time to finish deleting,
 	// so we don't want to block the HTTP call while waiting on this.
+	//
+	// Only skip file removal when:
+	//   1. shared storage pooling is explicitly enabled,
+	//   2. the pool has a name configured, and
+	//   3. this server is actively being transferred.
+	//
+	// This avoids preserving data for ordinary server deletions.
+	pool := config.Get().System.Transfers.StoragePool
+	skipFileRemoval := pool.Enabled && pool.PoolName != "" && s.IsTransferring()
+	if !skipFileRemoval {
+	    go func(s *server.Server) {
+	    	fs := s.Filesystem()
+	    	p := fs.Path()
+	    	_ = fs.UnixFS().Close()
+	    	if err := os.RemoveAll(p); err != nil {
+	    		log.WithFields(log.Fields{"path": p, "error": err}).
+	    			Warn("failed to remove server files during deletion process")
+	    	}
+
+	    	if config.Get().System.Quotas.Enabled {
+	    		if err = quotas.DelQuota(s.Config().Uuid); err != nil {
+	    			log.WithFields(log.Fields{"server_id": s.Config().Pid, "error": err}).
+	    				Warn("failed to remove quota during deletion process")
+	    		}
+	    	}
+	    }(s)
+	}
+
+
+	// remove hanging machine-id file for the server when removing
 	go func(s *server.Server) {
-		fs := s.Filesystem()
-		p := fs.Path()
-		_ = fs.UnixFS().Close()
-		if err := os.RemoveAll(p); err != nil {
-			log.WithFields(log.Fields{"path": p, "error": err}).Warn("failed to remove server files during deletion process")
+		if err := os.Remove(filepath.Join(config.Get().System.MachineID.Directory, s.ID())); err != nil {
+			log.WithFields(log.Fields{"server_id": s.ID(), "error": err}).
+				Warn("failed to remove machine-id file for server")
 		}
 	}(s)
 
@@ -295,6 +322,8 @@ func deleteServer(c *gin.Context) {
 // Adds any of the JTIs passed through in the body to the deny list for the websocket
 // preventing any JWT generated before the current time from being used to connect to
 // the socket or send along commands.
+//
+// deprecated: prefer /api/deauthorize-user
 func postServerDenyWSTokens(c *gin.Context) {
 	var data struct {
 		JTIs []string `json:"jtis"`

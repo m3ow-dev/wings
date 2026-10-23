@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -17,13 +18,14 @@ import (
 	dockerImage "github.com/docker/docker/api/types/image"
 
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/parsers/kernel"
 
-	"github.com/pelican-dev/wings/config"
-	"github.com/pelican-dev/wings/environment"
-	"github.com/pelican-dev/wings/remote"
-	"github.com/pelican-dev/wings/system"
+	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/remote"
+	"github.com/pelican/wings/system"
 )
 
 // Install executes the installation stack for a server process. Bubbles any
@@ -145,12 +147,22 @@ func (s *Server) IsInstalling() bool {
 	return s.installing.Load()
 }
 
+func (s *Server) SetInstalling(state bool) {
+	s.installing.Store(state)
+	if state {
+		s.Sftp().CancelAll()
+	}
+}
+
 func (s *Server) IsTransferring() bool {
 	return s.transferring.Load()
 }
 
 func (s *Server) SetTransferring(state bool) {
 	s.transferring.Store(state)
+	if state {
+		s.Sftp().CancelAll()
+	}
 }
 
 func (s *Server) IsRestoring() bool {
@@ -159,6 +171,13 @@ func (s *Server) IsRestoring() bool {
 
 func (s *Server) SetRestoring(state bool) {
 	s.restoring.Store(state)
+	if state {
+		s.Sftp().CancelAll()
+	}
+}
+
+func (s *Server) IsInProtectedState() bool {
+	return s.IsInstalling() || s.IsTransferring() || s.IsRestoring()
 }
 
 // RemoveContainer removes the installation container for the server.
@@ -182,7 +201,7 @@ func (ip *InstallationProcess) Run() error {
 	if !ip.Server.installing.SwapIf(true) {
 		return errors.New("install: cannot obtain installation lock")
 	}
-
+	ip.Server.Sftp().CancelAll()
 	// We now have an exclusive lock on this installation process. Ensure that whenever this
 	// process is finished that the semaphore is released so that other processes and be executed
 	// without encountering a wait timeout.
@@ -195,10 +214,10 @@ func (ip *InstallationProcess) Run() error {
 		return err
 	}
 
-	cID, err := ip.Execute()
-	if err != nil {
+	cID, executeErr := ip.Execute()
+	if cID == "" {
 		_ = ip.RemoveContainer()
-		return err
+		return executeErr
 	}
 
 	// If this step fails, log a warning but don't exit out of the process. This is completely
@@ -207,7 +226,7 @@ func (ip *InstallationProcess) Run() error {
 		ip.Server.Log().WithField("error", err).Warn("failed to complete after-execute step of installation process")
 	}
 
-	return nil
+	return executeErr
 }
 
 // Returns the location of the temporary data for the installation process.
@@ -237,19 +256,13 @@ func (ip *InstallationProcess) writeScriptToDisk() error {
 // Pulls the docker image to be used for the installation container.
 func (ip *InstallationProcess) pullInstallationImage() error {
 	// Get a registry auth configuration from the config.
-	var registryAuth *config.RegistryConfiguration
-	for registry, c := range config.Get().Docker.Registries {
-		if !strings.HasPrefix(ip.Script.ContainerImage, registry) {
-			continue
-		}
-
+	registry, registryAuth := config.Get().Docker.RegistryCredentialsForImage(ip.Script.ContainerImage)
+	if registryAuth != nil {
 		log.WithField("registry", registry).Debug("using authentication for registry")
-		registryAuth = &c
-		break
 	}
 
 	// Get the ImagePullOptions.
-	imagePullOptions := dockerImage.PullOptions{All: false}
+	imagePullOptions := dockerImage.PullOptions{All: false, Platform: runtime.GOOS + "/" + runtime.GOARCH}
 	if registryAuth != nil {
 		b64, err := registryAuth.Base64()
 		if err != nil {
@@ -475,7 +488,25 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		}
 	}()
 
-	r, err := ip.client.ContainerCreate(ctx, conf, hostConf, nil, nil, ip.Server.ID()+"_installer")
+	var netConf *network.NetworkingConfig = nil //In case when no networking config is needed set nil
+	var serverNetConfig = config.Get().Docker.Network
+	if "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver
+		var defaultMapping = ip.Server.Config().Allocations.DefaultMapping
+		ip.Server.Log().Debug("Set macvlan " + serverNetConfig.Name + " IP to " + defaultMapping.Ip)
+		netConf = &network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				serverNetConfig.Name: { //Get network name from wings config
+					IPAMConfig: &network.EndpointIPAMConfig{
+						IPv4Address: defaultMapping.Ip,
+					},
+					IPAddress: defaultMapping.Ip, //Use default mapping ip address (wings support only one network per server)
+					Gateway:   serverNetConfig.Interfaces.V4.Gateway,
+				},
+			},
+		}
+	}
+	// Pass the networkings configuration or nil if none required
+	r, err := ip.client.ContainerCreate(ctx, conf, hostConf, netConf, nil, ip.Server.ID()+"_installer")
 	if err != nil {
 		return "", err
 	}
@@ -498,18 +529,43 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	}(r.ID)
 
 	sChan, eChan := ip.client.ContainerWait(ctx, r.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-eChan:
-		// Once the container has stopped running we can mark the install process as being completed.
-		if err == nil {
-			ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
-		} else {
-			return "", err
-		}
-	case <-sChan:
+	if err := ip.waitForInstallationContainer(sChan, eChan); err != nil {
+		return r.ID, err
 	}
 
 	return r.ID, nil
+}
+
+func (ip *InstallationProcess) waitForInstallationContainer(sChan <-chan container.WaitResponse, eChan <-chan error) error {
+	select {
+	case err := <-eChan:
+		ip.Server.Events().Publish(DaemonMessageEvent, "Installation process failed: "+err.Error())
+		return err
+	case response := <-sChan:
+		if err := installationWaitError(response); err != nil {
+			ip.Server.Events().Publish(DaemonMessageEvent, "Installation process failed: "+err.Error())
+			return err
+		}
+	}
+
+	ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
+	return nil
+}
+
+func installationWaitError(response container.WaitResponse) error {
+	if response.Error != nil {
+		message := strings.TrimSpace(response.Error.Message)
+		if message == "" {
+			message = "unknown container wait error"
+		}
+
+		return errors.Errorf("install: installation container wait failed: %s", message)
+	}
+	if response.StatusCode != 0 {
+		return errors.Errorf("install: installation script exited with code %d", response.StatusCode)
+	}
+
+	return nil
 }
 
 // StreamOutput streams the output of the installation process to a log file in

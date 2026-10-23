@@ -8,10 +8,10 @@ import (
 	"emperror.dev/errors"
 	"github.com/goccy/go-json"
 
-	"github.com/pelican-dev/wings/events"
-	"github.com/pelican-dev/wings/system"
+	"github.com/pelican/wings/events"
+	"github.com/pelican/wings/system"
 
-	"github.com/pelican-dev/wings/server"
+	"github.com/pelican/wings/server"
 )
 
 // RegisterListenerEvents will setup the server event listeners and expiration
@@ -27,9 +27,9 @@ func (h *Handler) registerListenerEvents(ctx context.Context) {
 
 	go func() {
 		if err := h.listenForServerEvents(ctx); err != nil {
-			h.Logger().Warn("error while processing server event; closing websocket connection")
+			h.Logger().WithField("error", errors.WithStack(err)).Info("closing websocket connection after server event ended")
 			if err := h.Connection.Close(); err != nil {
-				h.Logger().WithField("error", errors.WithStack(err)).Error("error closing websocket connection")
+				h.Logger().WithField("error", errors.WithStack(err)).Info("websocket connection already closed")
 			}
 		}
 	}()
@@ -97,7 +97,7 @@ func (h *Handler) listenForServerEvents(ctx context.Context) error {
 	h.server.Sink(system.InstallSink).On(installOutput)
 
 	onError := func(evt string, err2 error) {
-		h.Logger().WithField("event", evt).WithField("error", err2).Error("failed to send event over server websocket")
+		h.Logger().WithField("event", evt).WithField("error", err2).Info("failed to send event over server websocket")
 		// Avoid race conditions by only setting the error once and then canceling
 		// the context. This way if additional processing errors come through due
 		// to a massive flood of things you still only report and stop at the first.
@@ -129,7 +129,7 @@ func (h *Handler) listenForServerEvents(ctx context.Context) error {
 				continue
 			}
 			var sendErr error
-			message := Message{Event: e.Topic}
+			message := Message{Event: Event(e.Topic)}
 			if str, ok := e.Data.(string); ok {
 				message.Args = []string{str}
 			} else if b, ok := e.Data.([]byte); ok {
@@ -147,7 +147,7 @@ func (h *Handler) listenForServerEvents(ctx context.Context) error {
 					continue
 				}
 			}
-			onError(message.Event, sendErr)
+			onError(string(message.Event), sendErr)
 		}
 		break
 	}

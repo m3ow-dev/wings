@@ -6,6 +6,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -14,11 +15,13 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/icza/dyno"
 	"github.com/magiconair/properties"
+	"github.com/pelletier/go-toml/v2"
+	"github.com/tidwall/pretty"
 	"gopkg.in/ini.v1"
 	"gopkg.in/yaml.v3"
 
-	"github.com/pelican-dev/wings/config"
-	"github.com/pelican-dev/wings/internal/ufs"
+	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/internal/ufs"
 )
 
 // The file parsing options that are available for a server configuration file.
@@ -29,7 +32,14 @@ const (
 	Ini        = "ini"
 	Json       = "json"
 	Xml        = "xml"
+	Toml       = "toml"
 )
+
+// maxTextScanTokenSize bounds how large a single line the "file" parser will buffer.
+const maxTextScanTokenSize = 64 * 1024 * 1024
+
+// maxConfigFileSize caps how large a configuration file we'll attempt to parse.
+const maxConfigFileSize = 64 * 1024 * 1024
 
 type ReplaceValue struct {
 	value     []byte
@@ -124,18 +134,27 @@ func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	if err := json.Unmarshal(*m["file"], &f.FileName); err != nil {
+	fileRaw, ok := m["file"]
+	if !ok || fileRaw == nil {
+		return errors.New("parser: configuration file missing required 'file' key")
+	}
+	if err := json.Unmarshal(*fileRaw, &f.FileName); err != nil {
 		return err
 	}
 
-	if err := json.Unmarshal(*m["parser"], &f.Parser); err != nil {
+	parserRaw, ok := m["parser"]
+	if !ok || parserRaw == nil {
+		return errors.New("parser: configuration file missing required 'parser' key")
+	}
+	if err := json.Unmarshal(*parserRaw, &f.Parser); err != nil {
 		return err
 	}
 
-	if err := json.Unmarshal(*m["replace"], &f.Replace); err != nil {
-		log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
-
-		f.Replace = []ConfigurationFileReplacement{}
+	f.Replace = []ConfigurationFileReplacement{}
+	if replaceRaw, ok := m["replace"]; ok && replaceRaw != nil {
+		if err := json.Unmarshal(*replaceRaw, &f.Replace); err != nil {
+			log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
+		}
 	}
 
 	// test if "create_file" exists, if not just assume true
@@ -200,13 +219,39 @@ func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type templatableConfig struct {
+	Docker struct {
+		Interface string `json:"interface"`
+		Network   struct {
+			Interface string `json:"interface"`
+		} `json:"network"`
+	} `json:"docker"`
+}
+
+func newTemplatableConfig(c *config.Configuration) templatableConfig {
+	var t templatableConfig
+	t.Docker.Interface = c.Docker.Network.Interface
+	t.Docker.Network.Interface = c.Docker.Network.Interface
+	return t
+}
+
 // Parse parses a given configuration file and updates all the values within
 // as defined in the API response from the Panel.
 func (f *ConfigurationFile) Parse(file ufs.File) error {
 	//log.WithField("path", path).WithField("parser", f.Parser.String()).Debug("parsing server configuration file")
 
+	// Refuse to parse files larger than the cap. Every parser below buffers the
+	// whole file in memory, and the contents are untrusted server-owned input, so
+	// this guards the daemon against being OOM'd by an oversized config. The
+	// server is still free to boot with the file as-is; we just don't rewrite it.
+	if info, err := file.Stat(); err != nil {
+		return err
+	} else if info.Size() > maxConfigFileSize {
+		return errors.Errorf("parser: refusing to parse configuration file %q: size %d exceeds limit of %d bytes", file.Name(), info.Size(), maxConfigFileSize)
+	}
+
 	// What the fuck is going on here?
-	if mb, err := json.Marshal(config.Get()); err != nil {
+	if mb, err := json.Marshal(newTemplatableConfig(config.Get())); err != nil {
 		return err
 	} else {
 		f.configuration = mb
@@ -227,6 +272,8 @@ func (f *ConfigurationFile) Parse(file ufs.File) error {
 		err = f.parseIniFile(file)
 	case Xml:
 		err = f.parseXmlFile(file)
+	case Toml:
+		err = f.parseTomlFile(file)
 	}
 	return err
 }
@@ -234,7 +281,7 @@ func (f *ConfigurationFile) Parse(file ufs.File) error {
 // Parses an xml file.
 func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 	doc := etree.NewDocument()
-	if _, err := doc.ReadFrom(file); err != nil {
+	if _, err := doc.ReadFrom(io.LimitReader(file, maxConfigFileSize)); err != nil {
 		return err
 	}
 
@@ -286,6 +333,7 @@ func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 				k := xmlValueMatchRegex.ReplaceAllString(value, "$1")
 				v := xmlValueMatchRegex.ReplaceAllString(value, "$2")
 
+				element.RemoveAttr(k)
 				element.CreateAttr(k, v)
 			} else {
 				element.SetText(value)
@@ -313,10 +361,14 @@ func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 // Parses an ini file.
 func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 	// Wrap the file in a NopCloser so the ini package doesn't close the file.
-	cfg, err := ini.Load(io.NopCloser(file))
+	cfg, err := ini.Load(io.NopCloser(io.LimitReader(file, maxConfigFileSize)))
 	if err != nil {
 		return err
 	}
+
+	// Force format to be key = value
+	ini.PrettyFormat = false
+	ini.PrettyEqual = true
 
 	for _, replacement := range f.Replace {
 		var (
@@ -393,7 +445,7 @@ func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 // value is set regardless in the file. See the commentary in parseYamlFile for more details
 // about what is happening during this process.
 func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
-	b, err := io.ReadAll(file)
+	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
@@ -410,8 +462,14 @@ func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
 		return err
 	}
 
-	// Write the data to the file.
-	if _, err := io.Copy(file, bytes.NewReader(data.BytesIndent("", "    "))); err != nil {
+	prettified := pretty.PrettyOptions(data, &pretty.Options{
+		Width:    80,
+		Prefix:   "",
+		Indent:   "  ",
+		SortKeys: false,
+	})
+
+	if _, err := io.Copy(file, bytes.NewReader(prettified)); err != nil {
 		return errors.Wrap(err, "parser: failed to write properties file to disk")
 	}
 	return nil
@@ -420,7 +478,7 @@ func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
 // Parses a yaml file and updates any matching key/value pairs before persisting
 // it back to the disk.
 func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
-	b, err := io.ReadAll(file)
+	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
@@ -431,8 +489,8 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 	}
 
 	// Unmarshal the yaml data into a JSON interface such that we can work with
-	// any arbitrary data structure. If we don't do this, I can't use gabs which
-	// makes working with unknown JSON significantly easier.
+	// any arbitrary data structure. This allows us to use gjson/sjson for
+	// working with unknown JSON significantly easier.
 	jsonBytes, err := json.Marshal(dyno.ConvertMapI2MapS(i))
 	if err != nil {
 		return err
@@ -445,8 +503,15 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 		return err
 	}
 
-	// Remarshal the JSON into YAML format before saving it back to the disk.
-	marshaled, err := yaml.Marshal(data.Data())
+	var jsonData interface{}
+	yamlDecoder := json.NewDecoder(bytes.NewReader(data))
+	yamlDecoder.UseNumber()
+	if err := yamlDecoder.Decode(&jsonData); err != nil {
+		return err
+	}
+	jsonData = normalizeYamlTypes(jsonData)
+
+	marshaled, err := yaml.Marshal(jsonData)
 	if err != nil {
 		return err
 	}
@@ -465,12 +530,134 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 	return nil
 }
 
+// Parses a toml file and updates any matching key/value pairs before persisting
+// it back to the disk.
+func (f *ConfigurationFile) parseTomlFile(file ufs.File) error {
+	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
+	if err != nil {
+		return err
+	}
+
+	i := make(map[string]interface{})
+	if err := toml.Unmarshal(b, &i); err != nil {
+		return err
+	}
+
+	// Convert to JSON to reuse IterateOverJson for value replacement.
+	jsonBytes, err := json.Marshal(dyno.ConvertMapI2MapS(i))
+	if err != nil {
+		return err
+	}
+
+	data, err := f.IterateOverJson(jsonBytes)
+	if err != nil {
+		return err
+	}
+
+	var jsonData interface{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&jsonData); err != nil {
+		return err
+	}
+	jsonData = normalizeTomlTypes(jsonData)
+
+	// Remarshal back to TOML format.
+	marshaled, err := toml.Marshal(jsonData)
+	if err != nil {
+		return err
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
+		return errors.Wrap(err, "parser: failed to write toml file to disk")
+	}
+	return nil
+}
+
+// normalizeYamlTypes converts json.Number values (produced by UseNumber()) into
+// proper Go numeric types so that yaml.Marshal writes integers as plain integers
+// instead of float64 scientific notation (e.g. 1.5e+18 for large Snowflake IDs).
+func normalizeYamlTypes(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, item := range typed {
+			typed[key] = normalizeYamlTypes(item)
+		}
+		return typed
+	case []interface{}:
+		for i := range typed {
+			typed[i] = normalizeYamlTypes(typed[i])
+		}
+		return typed
+	case json.Number:
+		s := typed.String()
+		// Preserve float representation: if the number contains '.', 'e' or 'E'
+		// it was originally a float and must not be coerced to int64.
+		if strings.ContainsAny(s, ".eE") {
+			if floatVal, err := typed.Float64(); err == nil {
+				return floatVal
+			}
+			return s
+		}
+		if intVal, err := typed.Int64(); err == nil {
+			return intVal
+		}
+		if floatVal, err := typed.Float64(); err == nil {
+			return floatVal
+		}
+		return s
+	default:
+		return value
+	}
+}
+
+func normalizeTomlTypes(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, item := range typed {
+			typed[key] = normalizeTomlTypes(item)
+		}
+		return typed
+	case []interface{}:
+		for i := range typed {
+			typed[i] = normalizeTomlTypes(typed[i])
+		}
+		return typed
+	case json.Number:
+		if intVal, err := typed.Int64(); err == nil {
+			return intVal
+		}
+		if floatVal, err := typed.Float64(); err == nil {
+			return floatVal
+		}
+		return typed.String()
+	case string:
+		if timeVal, err := time.Parse(time.RFC3339Nano, typed); err == nil {
+			return timeVal
+		}
+		if timeVal, err := time.Parse(time.RFC3339, typed); err == nil {
+			return timeVal
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
 // Parses a text file using basic find and replace. This is a highly inefficient method of
 // scanning a file and performing a replacement. You should attempt to use anything other
 // than this function where possible.
 func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 	b := bytes.NewBuffer(nil)
-	s := bufio.NewScanner(file)
+	s := bufio.NewScanner(io.LimitReader(file, maxConfigFileSize))
+	s.Buffer(make([]byte, 0, 64*1024), maxTextScanTokenSize)
 	var replaced bool
 	for s.Scan() {
 		line := s.Bytes()
@@ -488,6 +675,9 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 			b.Write(line)
 		}
 		b.WriteByte('\n')
+	}
+	if err := s.Err(); err != nil {
+		return errors.Wrap(err, "parser: failed to scan text file for configuration update")
 	}
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -531,7 +721,7 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 // @see https://github.com/pterodactyl/panel/issues/2308 (original)
 // @see https://github.com/pterodactyl/panel/issues/3009 ("bug" introduced as result)
 func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
-	b, err := io.ReadAll(file)
+	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}

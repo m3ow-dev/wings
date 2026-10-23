@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -19,9 +20,9 @@ import (
 	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/pelican-dev/wings/config"
-	"github.com/pelican-dev/wings/remote"
-	"github.com/pelican-dev/wings/server"
+	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/remote"
+	"github.com/pelican/wings/server"
 )
 
 // Usernames all follow the same format, so don't even bother hitting the API if the username is not
@@ -125,11 +126,17 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 	defer sconn.Close()
 	go ssh.DiscardRequests(reqs)
 
+	// Tracks every "Handle" goroutine spawned for this connection so that we can
+	// wait for them to finish before this function returns. Without this, channels
+	// could still be in use after "sconn" is closed by the caller's deferred call.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	for ch := range chans {
-		// If its not a session channel we just move on because its not something we
+		// If not a session channel we just move on because it's not something we
 		// know how to handle at this point.
 		if ch.ChannelType() != "session" {
-			ch.Reject(ssh.UnknownChannelType, "unknown channel type")
+			_ = ch.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
 		}
 
@@ -143,39 +150,66 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 				// Channels have a type that is dependent on the protocol. For SFTP
 				// this is "subsystem" with a payload that (should) be "sftp". Discard
 				// anything else we receive ("pty", "shell", etc)
-				req.Reply(req.Type == "subsystem" && string(req.Payload[4:]) == "sftp", nil)
+				ok := req.Type == "subsystem" && len(req.Payload) >= 4 && string(req.Payload[4:]) == "sftp"
+				_ = req.Reply(ok, nil)
 			}
 		}(requests)
 
-		// If no UUID has been set on this inbound request then we can assume we
-		// have screwed up something in the authentication code. This is a sanity
-		// check, but should never be encountered (ideally...).
-		//
-		// This will also attempt to match a specific server out of the global server
-		// store and return nil if there is no match.
-		uuid := sconn.Permissions.Extensions["uuid"]
-		srv := c.manager.Find(func(s *server.Server) bool {
-			if uuid == "" {
-				return false
-			}
-			return s.ID() == uuid
-		})
-		if srv == nil {
+		srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"])
+		if !ok {
+			// No matching server instance for this connection's UUID: nothing will
+			// ever consume this channel, so close it immediately to avoid leaking it.
+			_ = channel.Close()
 			continue
 		}
 
-		// Spin up a SFTP server instance for the authenticated user's server allowing
-		// them access to the underlying filesystem.
-		handler, err := NewHandler(sconn, srv)
-		if err != nil {
-			return errors.WithStackIf(err)
-		}
-		rs := sftp.NewRequestServer(channel, handler.Handlers())
-		if err := rs.Serve(); err == io.EOF {
-			_ = rs.Close()
-		}
+		// Handle each channel concurrently so a slow or stuck client on one channel
+		// (e.g. gvfs holding a session open) can't block the rest of the connection.
+		wg.Add(1)
+		go func(channel ssh.Channel) {
+			defer wg.Done()
+			if err := c.Handle(sconn, srv, channel); err != nil {
+				_ = channel.Close()
+				log.WithField("error", err).
+					WithField("ip", conn.RemoteAddr().String()).
+					Error("sftp: error handling channel")
+			}
+		}(channel)
+	}
+	return nil
+}
+
+// Handle spins up a SFTP server instance for the authenticated user's server allowing
+// them access to the underlying filesystem.
+func (c *SFTPServer) Handle(conn *ssh.ServerConn, srv *server.Server, channel ssh.Channel) error {
+	handler, err := NewHandler(conn, srv)
+	if err != nil {
+		return errors.WithStackIf(err)
 	}
 
+	ctx := srv.Sftp().Context(handler.User())
+	rs := sftp.NewRequestServer(channel, handler.Handlers())
+
+	// Signals the supervisor goroutine below to stop watching "ctx" once this
+	// function returns, so it doesn't linger until the server's protected-state
+	// context is eventually cancelled (which may be much later, or never).
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			srv.Log().WithField("user", conn.User()).Warn("sftp: terminating active session")
+			_ = rs.Close()
+		case <-done:
+		}
+	}()
+
+	err = rs.Serve()
+	_ = rs.Close()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
 	return nil
 }
 
@@ -221,6 +255,11 @@ func (c *SFTPServer) makeCredentialsRequest(conn ssh.ConnMetadata, t remote.Sftp
 	if !validUsernameRegexp.MatchString(request.User) {
 		logger.Warn("failed to validate user credentials (invalid format)")
 		return nil, &remote.SftpInvalidCredentialsError{}
+	}
+
+	if t == remote.SftpAuthPassword && config.Get().System.Sftp.KeyOnly {
+		logger.Warn("failed to validate user credentials (password authentication is disabled; only SSH keys are allowed)")
+		return nil, &remote.SftpKeyOnlyError{}
 	}
 
 	resp, err := c.manager.Client().ValidateSftpCredentials(context.Background(), request)
